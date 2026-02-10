@@ -1,1 +1,5 @@
+Este proyecto tiene como fin desarrollar una solución automática que controle remotamente una instalación de riego.
 
+El proyecto consiste en una instalación de riego que sea controlada mediante una página web, en cuya instalación se incluye:
+- Actuadores: Bomba, Electroválvula 1 y Electroválvula 2.
+- Sensores: Caudalímetro, Sensor de presión, Sensor de Humedad 1, Sensor de Humedad 2, Nivel y Marcha/Paro.
