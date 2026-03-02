@@ -1,0 +1,550 @@
+#include <stdio.h>
+#include <string.h>
+#include <math.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/gpio.h"
+#include "esp_timer.h"
+#include "esp_log.h"
+#include "esp_adc/adc_oneshot.h"
+#include "driver/ledc.h"
+#include "nvs_flash.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "mqtt_client.h"
+
+
+// definición pines de entrada y salida
+#define PinMarchaParo 18
+#define MaskPinMarchaParo 1ULL << PinMarchaParo
+
+#define PinNivel 32
+#define MaskPinNivel 1ULL << PinNivel
+
+#define PinCaudalimetro 36
+#define MaskPinCaudalimetro 1ULL << PinCaudalimetro
+
+#define PinSensorPresion 39
+#define MaskPinSensorPresion 1ULL << PinSensorPresion
+
+#define PinSensorHumedad1 34
+#define MaskPinSensorHumedad1 1ULL << PinSensorHumedad1
+
+#define PinSensorHumedad2 35
+#define MaskPinSensorHumedad2 1ULL << PinSensorHumedad2
+
+#define PinActBomba 33
+#define MaskPinActBomba 1ULL << PinActBomba
+
+#define PinActElectroValvula1 23
+#define MaskPinActElectroValvula1 1ULL << PinActElectroValvula1
+
+#define PinActElectroValvula2 22
+#define MaskPinActElectroValvula2 1ULL << PinActElectroValvula2
+
+#define SIZETAREAS 4096
+
+static const char* TAG = "ProyectoFinal";
+
+// datos propios
+typedef struct main
+{
+    int id;
+    int funcion;
+    int readWrite;
+    int dato;
+}packetSend_t;
+
+
+//declaración funciones callback eventos del sistema loop default
+
+void callBackWifiEvent(void* handler_arg, esp_event_base_t base, int32_t id, void* event_data);
+void callBackIpEvent(void* handler_arg, esp_event_base_t base, int32_t id, void* event_data);
+void callBackMqttEvent(void* handler_arg, esp_event_base_t base, int32_t id, void* event_data);
+
+
+//declaración funciones tareas
+void tareaActBomba( void * pvParameters );
+void tareaActEV1( void * pvParameters );
+void tareaActEV2( void * pvParameters );
+
+void tareaSenNivel( void * pvParameters );
+void tareaSenCaudalimetro( void * pvParameters );
+void tareaSenPresion( void * pvParameters );
+void tareaSenHumedad1( void * pvParameters );
+void tareaSenHumedad2( void * pvParameters );
+void tareaSenMarchaParo( void * pvParameters );
+void tareaEnvioMqtt( void * pvParameters );
+//handles
+
+esp_mqtt_client_handle_t h_mqttClient;
+TaskHandle_t h_tareaActElecVal1;
+TaskHandle_t h_tareaActElecVal2;
+TaskHandle_t h_tareaActBomba;
+TaskHandle_t h_tareaSenNivel;
+TaskHandle_t h_tareaSenCaudalimetro;
+TaskHandle_t h_tareaSenPresion;
+TaskHandle_t h_tareaSenHumedad1;
+TaskHandle_t h_tareaSenHumedad2;
+TaskHandle_t h_tareaSenMarchaParo;
+
+TaskHandle_t h_tareaEnvioMqtt;
+
+QueueHandle_t h_colaBomba;
+QueueHandle_t h_colaEV1;
+QueueHandle_t h_colaEV2;
+QueueHandle_t h_colaSensores;
+QueueHandle_t h_colaEnvioMqtt;
+
+//handle semaforo
+SemaphoreHandle_t h_semaforoEnvioMqtt;
+
+//handle unit CAD
+adc_oneshot_unit_handle_t h_cadUnit1;
+
+QueueHandle_t vectorHandlesColasActuadores [3] = {};
+//vectorHandlesColasActuadores[0] = h_colaBomba;
+
+void app_main(void)
+{
+    // Inicializar semáforo
+    h_semaforoEnvioMqtt = xSemaphoreCreateBinary();
+    if (h_semaforoEnvioMqtt == NULL)
+    {
+        ESP_LOGI(TAG, "Error: No se pudo crear el semáforo");
+    }
+
+    //Configuración sensor pulsador gpio 18
+    gpio_config_t configSenMarchaParo = {
+        .pin_bit_mask = MaskPinMarchaParo,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_POSEDGE
+    };
+    gpio_config(&configSenMarchaParo);
+
+    //Configuración sensor nivel gpio 32
+    gpio_config_t configSenNivel = {
+        .pin_bit_mask = MaskPinNivel,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_POSEDGE
+    };
+    gpio_config(&configSenNivel);
+
+    //Configuración sensor caudalimetro gpio 36
+    gpio_config_t configSenCaudalimetro = {
+        .pin_bit_mask = MaskPinCaudalimetro,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_POSEDGE
+    };
+    gpio_config(&configSenCaudalimetro);
+
+    //Configuración sensor de presión gpio 39
+    gpio_config_t configSenPresion = {
+        .pin_bit_mask = MaskPinSensorPresion,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_POSEDGE
+    };
+    gpio_config(&configSenPresion);
+
+    //Configuración sensor de humedad 1 gpio 34
+    gpio_config_t configSenHumedad1 = {
+        .pin_bit_mask = MaskPinSensorHumedad1,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_POSEDGE
+    };
+    gpio_config(&configSenHumedad1);
+
+    //Configuración sensor de humedad 2 gpio 35
+    gpio_config_t configSenHumedad2 = {
+        .pin_bit_mask = MaskPinSensorHumedad2,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_POSEDGE
+    };
+    gpio_config(&configSenHumedad2);
+
+
+    //Configuración actuador bomba gpio 33
+    gpio_config_t configActBom = {
+        .pin_bit_mask = MaskPinActBomba,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+    gpio_config(&configActBom);
+
+    //Configuración actuador electrovalvula1 gpio 23
+    gpio_config_t configActEV1 = {
+        .pin_bit_mask = MaskPinActElectroValvula1,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+    gpio_config(&configActEV1);
+
+    //Configuración actuador electrovalvula2 gpio 22
+    gpio_config_t configActEV2 = {
+        .pin_bit_mask = MaskPinActElectroValvula2,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+    gpio_config(&configActEV2);
+   
+    //crear colas
+    h_colaBomba = xQueueCreate(1,sizeof(int));
+    h_colaEV1 = xQueueCreate(1,sizeof(int));
+    h_colaEV2 = xQueueCreate(1,sizeof(int));
+    h_colaSensores = xQueueCreate(1,sizeof(int));
+    h_colaEnvioMqtt = xQueueCreate(1,sizeof(packetSend_t));
+    
+    //Crear unidad CAD 
+    
+    adc_oneshot_unit_init_cfg_t configUnit1 = {
+    .unit_id = ADC_UNIT_1,
+    .ulp_mode = ADC_ULP_MODE_DISABLE,
+    };
+    adc_oneshot_new_unit(&configUnit1, &h_cadUnit1);
+
+    //crear tareas
+   
+   // xTaskCreate( tareaActBomba,"tareasActBomba", SIZETAREAS, NULL, 1, &h_tareaActBomba);
+    xTaskCreate( tareaActEV1,"tareasActElecVal1", SIZETAREAS, NULL, 1, &h_tareaActElecVal1);
+    xTaskCreate( tareaActEV2,"tareasActElecVal2", SIZETAREAS, NULL, 1, &h_tareaActElecVal2);
+    // La tarea de humedad se creará cuando el cliente MQTT esté inicializado
+    xTaskCreate( tareaEnvioMqtt,"tareasEnvioMqtt", SIZETAREAS, NULL, 1, &h_tareaEnvioMqtt);
+  /*  xTaskCreate( tareaSenMarchaParo,"tareasSenMarchaParo", SIZETAREAS, NULL, 1, &h_tareaSenMarchaParo);
+    xTaskCreate( tareaSenNivel,"tareasSenNivel", SIZETAREAS, NULL, 1, &h_tareaSenNivel);
+    xTaskCreate( tareaSenCaudalimetro,"tareasSenMarchaParo", SIZETAREAS, NULL, 1, &h_tareaSenCaudalimetro);
+    xTaskCreate( tareaSenPresion,"tareasSenPresion", SIZETAREAS, NULL, 1, &h_tareaSenPresion);
+    xTaskCreate( tareaSenHumedad2,"tareasSenHumedad2", SIZETAREAS, NULL, 1, &h_tareaSenHumedad2);
+
+    
+*/
+
+
+    nvs_flash_init(); // crear partición para pila TCP-IP
+    esp_netif_init(); // iniciar la interfaz wifi
+    esp_event_loop_create_default(); // crear gestor de evento del sistema
+    esp_netif_create_default_wifi_sta(); // interfaz como station
+
+    esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, callBackWifiEvent, NULL, NULL);
+    esp_event_handler_instance_register(IP_EVENT, ESP_EVENT_ANY_ID, callBackIpEvent, NULL, NULL);
+   
+    wifi_init_config_t configWifi = WIFI_INIT_CONFIG_DEFAULT();
+    esp_wifi_init(&configWifi);
+    
+    // Establecer modo WiFi como STATION (cliente)
+    esp_wifi_set_mode(WIFI_MODE_STA);
+    ESP_LOGI(TAG, "WiFi: Configurado como STATION");
+
+    wifi_config_t configWifiInterface = {
+        .sta = {
+            .ssid = "Iot7",
+            .password = "12345678"
+        }
+    };
+    esp_wifi_set_config(WIFI_IF_STA, &configWifiInterface);
+    ESP_LOGI(TAG, "WiFi: Credenciales configuradas");
+    esp_wifi_start();
+    ESP_LOGI(TAG, "WiFi: Iniciando conexión...");
+   
+    // Ceder control a otras tareas
+    while(1)
+    {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
+//Definición de funciones de callback
+void callBackWifiEvent(void* handler_arg, esp_event_base_t base, int32_t id, void* event_data)
+{
+    if (id == WIFI_EVENT_STA_START)
+    {
+        ESP_LOGI(TAG, "Función wifi se ha iniciado");
+        esp_wifi_connect();
+    }
+   
+}
+
+// Conectar ak broker MQTT al obtener IP
+static bool humedadTaskCreated = false;
+
+void callBackIpEvent(void* handler_arg, esp_event_base_t base, int32_t id, void* event_data)
+{
+   
+    if(id == IP_EVENT_STA_GOT_IP)
+    {
+        ESP_LOGI(TAG, "ip obtenida");
+        const esp_mqtt_client_config_t mqtt_cfg = {
+        .broker.address.uri = "mqtt://10.0.7.248",
+        };
+        h_mqttClient = esp_mqtt_client_init(&mqtt_cfg);
+        esp_mqtt_client_register_event(h_mqttClient,ESP_EVENT_ANY_ID, callBackMqttEvent, NULL);
+        esp_mqtt_client_start(h_mqttClient);
+
+        // crear tarea de humedad ahora que el cliente mqtt existe
+        if (!humedadTaskCreated) {
+            xTaskCreate( tareaSenHumedad1, "tareasSenHumedad1", SIZETAREAS, NULL, 1, &h_tareaSenHumedad1);
+            humedadTaskCreated = true;
+        }
+    }
+}
+void callBackMqttEvent(void* handler_arg, esp_event_base_t base, int32_t id, void* event_data)
+{
+    esp_mqtt_event_t * datoRecibido;
+    datoRecibido = (esp_mqtt_event_t*)event_data;
+
+    if(id == MQTT_EVENT_CONNECTED)
+    {
+        ESP_LOGI(TAG, "MQTT: conectado al broker");
+        esp_mqtt_client_subscribe_single(h_mqttClient, "1/0", 0);
+        esp_mqtt_client_subscribe_single(h_mqttClient, "2/0", 0);
+    }
+    else if( id == MQTT_EVENT_SUBSCRIBED)
+    {
+        ESP_LOGI(TAG, "MQTT: unido a topic");
+    }
+    else if (id == MQTT_EVENT_DATA)
+    {
+        ESP_LOGI(TAG, "MQTT DATA - Topic: %.*s, Payload: %.*s, Len: %d",
+                 datoRecibido->topic_len, datoRecibido->topic,
+                 datoRecibido->data_len, datoRecibido->data,
+                 datoRecibido->data_len);
+        
+        if (datoRecibido->data_len > 0)
+        {
+            int valor = (datoRecibido->data[0] == '1') ? 1 : 0;
+
+            // Suscribirse a los topics
+            if (datoRecibido->topic_len == 3 && strncmp(datoRecibido->topic, "1/0", 3) == 0)
+            {
+                if (xQueueSend(h_colaEV1, &valor, 0) == pdPASS)
+                {
+                    ESP_LOGI(TAG, "Comando EV1 enviado a cola: %d", valor);
+                }
+                else
+                {
+                    ESP_LOGI(TAG, "Error: Cola EV1 llena");
+                }
+            }
+            else if (datoRecibido->topic_len == 3 && strncmp(datoRecibido->topic, "2/0", 3) == 0)
+            {
+                if (xQueueSend(h_colaEV2, &valor, 0) == pdPASS)
+                {
+                    ESP_LOGI(TAG, "Comando EV2 enviado a cola: %d", valor);
+                }
+                else
+                {
+                    ESP_LOGI(TAG, "Error: Cola EV2 llena");
+                }
+            }
+            else
+            {
+                ESP_LOGI(TAG, "Topic no reconocido: %.*s", datoRecibido->topic_len, datoRecibido->topic);
+            }
+        }
+        else
+        {
+            ESP_LOGI(TAG, "Payload vacío");
+        }
+    }
+}
+
+// Funciones de los sensores y actuadores
+void tareaActBomba( void * pvParameters )
+{
+    int dato;
+
+    while(1)
+    {
+        xQueueReceive( h_colaBomba, &dato, portMAX_DELAY);
+        ESP_LOGI(TAG, "DATO TAREA BOMBA %d", dato);
+    }
+}
+
+void tareaActEV1( void * pvParameters )
+{
+    int dato;
+    
+    while(1)
+    {
+        // Esperar por comando en la cola
+        if (xQueueReceive(h_colaEV1, &dato, portMAX_DELAY) == pdPASS)
+        {
+            if (dato == 1)
+            {
+                gpio_set_level(PinActElectroValvula1, 1);
+                ESP_LOGI(TAG, "TareaActEV1: Relé ACTIVADO (GPIO %d nivel 1)", PinActElectroValvula1);
+            }
+            else if (dato == 0)
+            {
+                gpio_set_level(PinActElectroValvula1, 0);
+                ESP_LOGI(TAG, "TareaActEV1: Relé DESACTIVADO (GPIO %d nivel 0)", PinActElectroValvula1);
+            }
+        }
+    }
+}
+
+void tareaActEV2( void * pvParameters )
+{
+    int dato;
+
+    while(1)
+    {
+        // Esperar por comando en la cola
+        if (xQueueReceive(h_colaEV2, &dato, portMAX_DELAY) == pdPASS)
+        {
+            if (dato == 1)
+            {
+                gpio_set_level(PinActElectroValvula2, 1);
+                ESP_LOGI(TAG, "TareaActEV2: Relé ACTIVADO (GPIO %d nivel 1)", PinActElectroValvula2);
+            }
+            else if (dato == 0)
+            {
+                gpio_set_level(PinActElectroValvula2, 0);
+                ESP_LOGI(TAG, "TareaActEV2: Relé DESACTIVADO (GPIO %d nivel 0)", PinActElectroValvula2);
+            }
+        }
+    }
+}
+
+void tareaSenNivel( void * pvParameters )
+{
+    while(1)
+    {
+        vTaskDelay(1000);
+    }
+}
+
+void tareaSenCaudalimetro( void * pvParameters )
+{
+    while(1)
+    {
+        vTaskDelay(1000);
+    }
+}
+
+void tareaSenPresion( void * pvParameters )
+{
+    while(1)
+    {
+        vTaskDelay(1000);
+    }
+}
+
+void tareaSenHumedad1( void * pvParameters )
+{
+    ESP_LOGI(TAG, "tareaSenHumedad1 iniciada");
+
+    packetSend_t datoEnviar = {
+        .id = 10,
+        .funcion = 0,
+        .readWrite = 0,
+        .dato = 0
+    };
+
+    // configuración sensor humedad 1 gpio 34
+    gpio_config_t configSenHumedad1 = {
+        .pin_bit_mask = MaskPinSensorHumedad1,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+    gpio_config(&configSenHumedad1);
+
+    adc_oneshot_chan_cfg_t config = {
+        .bitwidth = ADC_BITWIDTH_10,
+        .atten = ADC_ATTEN_DB_12,
+    };
+    esp_err_t err = adc_oneshot_config_channel(h_cadUnit1, ADC_CHANNEL_6, &config);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Error configuring ADC channel: %d", err);
+    }
+
+    while(1)
+    {
+        int read_val = 0;
+        err = adc_oneshot_read(h_cadUnit1, ADC_CHANNEL_6, &read_val);
+        if (err == ESP_OK) {
+            /*
+             * Map ADC value to percentage:
+             *   raw = 740 -> 0%
+             *   raw = 350 -> 100%
+             * linear interpolation between these points, clamp to [0,100].
+             */
+            int percent;
+            if (read_val >= 740) {
+                percent = 0;
+            } else if (read_val <= 350) {
+                percent = 100;
+            } else {
+                percent = (740 - read_val) * 100 / (740 - 350);
+            }
+            datoEnviar.dato = percent;
+            ESP_LOGI(TAG, "HUMEDAD1 CAD: %d -> %d%%", read_val, percent);
+        } else {
+            ESP_LOGE(TAG, "ADC read error: %d", err);
+        }
+
+        // Enviar sin bloquear con semáforo; la cola se usa como buffer
+        xQueueSend(h_colaEnvioMqtt, &datoEnviar, portMAX_DELAY);
+        vTaskDelay(pdMS_TO_TICKS(10000));
+    }
+}
+
+void tareaSenHumedad2( void * pvParameters )
+{
+    while(1)
+    {
+        vTaskDelay(1000);
+    }
+}
+
+void tareaSenMarchaParo( void * pvParameters )
+{
+    while(1)
+    {
+        vTaskDelay(1000);
+    }
+}
+
+void tareaEnvioMqtt( void * pvParameters )
+{
+    // inicialmente no es necesario dar semáforo
+    packetSend_t datoRecibido;
+    char topic[10] = {};
+    char dato[10] = {};
+    while(1)
+    {
+        xQueueReceive(h_colaEnvioMqtt, &datoRecibido, portMAX_DELAY);
+        ESP_LOGI(TAG, "id %d, funcion %d, dato %d", datoRecibido.id, datoRecibido.funcion, datoRecibido.dato);
+
+        sprintf(topic, "%d/%d", datoRecibido.id, datoRecibido.funcion);
+        sprintf(dato, "%d", datoRecibido.dato);
+        if (h_mqttClient != NULL) {
+            esp_mqtt_client_publish(h_mqttClient, topic, dato, sizeof(dato), 0, 0);
+            ESP_LOGI(TAG, "topic %s, dato %s", topic, dato);
+        } else {
+            ESP_LOGW(TAG, "MQTT client not ready, dropping packet");
+        }
+
+        // liberar semáforo si se utiliza en otros lugares
+        xSemaphoreGive(h_semaforoEnvioMqtt);
+    }
+}
